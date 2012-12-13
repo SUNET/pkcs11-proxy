@@ -2077,7 +2077,7 @@ static int write_all(int sock, unsigned char *data, size_t len)
 
 	while (len > 0) {
 
-                r = send(sock, (void *)data, len, 0);
+                r = send(sock, (void *)data, len, MSG_NOSIGNAL);
 
 		if (r == -1) {
 			if (errno == EPIPE) {
