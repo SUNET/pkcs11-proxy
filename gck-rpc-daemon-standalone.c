@@ -66,18 +66,51 @@ static int install_syscall_filter(void)
                 ALLOW_SYSCALL(futex),
                 ALLOW_SYSCALL(brk),
                 ALLOW_SYSCALL(open),
+#ifdef __NR_fstat64
                 ALLOW_SYSCALL(fstat64),
+#else
+                ALLOW_SYSCALL(fstat),
+#endif
+#ifdef __NR_mmap2
                 ALLOW_SYSCALL(mmap2),
+#else
+		ALLOW_SYSCALL(mmap),
+#endif
                 ALLOW_SYSCALL(mprotect),
                 ALLOW_SYSCALL(close),
                 ALLOW_SYSCALL(access),
                 ALLOW_SYSCALL(munmap),
                 ALLOW_SYSCALL(time),
+#ifdef __NR__llseek
                 ALLOW_SYSCALL(_llseek),
+#else
+		ALLOW_SYSCALL(lseek),
+#endif
+#ifdef __NR_stat64
                 ALLOW_SYSCALL(stat64),
+#else
+                ALLOW_SYSCALL(stat),
+#endif
+#ifdef __NR_fcntl64
                 ALLOW_SYSCALL(fcntl64),
+#else
+                ALLOW_SYSCALL(fcntl),
+#endif
                 ALLOW_SYSCALL(mlock),
                 ALLOW_SYSCALL(munlock),
+		ALLOW_SYSCALL(socket),
+		ALLOW_SYSCALL(setsockopt),
+		ALLOW_SYSCALL(bind),
+		ALLOW_SYSCALL(listen),
+		ALLOW_SYSCALL(getsockname),
+		ALLOW_SYSCALL(connect),
+		ALLOW_SYSCALL(sendto),
+		ALLOW_SYSCALL(select),
+		ALLOW_SYSCALL(accept),
+		ALLOW_SYSCALL(clone),
+		ALLOW_SYSCALL(set_robust_list),
+		ALLOW_SYSCALL(recvfrom),
+		ALLOW_SYSCALL(madvise),
 		KILL_PROCESS,
 	};
 	struct sock_fprog prog = {
