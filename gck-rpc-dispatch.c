@@ -72,7 +72,6 @@ typedef struct _DispatchState {
 	struct _DispatchState *next;
 	pthread_t thread;
 	CallState cs;
-	int socket;
 } DispatchState;
 
 /* A linked list of dispatcher threads */
@@ -105,10 +104,10 @@ void gck_rpc_log(const char *msg, ...)
 	va_start(ap, msg);
 #if DEBUG_OUTPUT
 	vfprintf(stderr, msg, ap);
+	fprintf(stderr, "\n");
 #else
         vsyslog(LOG_INFO,msg,ap);        
 #endif
-	printf("\n");
 	va_end(ap);
 }
 
@@ -215,9 +214,11 @@ proto_read_byte_buffer(CallState * cs, CK_BYTE_PTR * buffer,
 	*n_buffer = length;
 	*buffer = NULL;
 
-	/* If set to zero, then they just want the length */
-	if (!length)
-		return CKR_OK;
+	/* We go ahead and allocate a buffer even if length is zero. The code used
+	 * to just return CKR_OK without allocating a buffer, but that breaks a
+	 * test case in pkcs11-tool for C_GenerateRandom of 0 bytes. Best to be as
+	 * transparent as possible and let the p11 module decide how to handle it.
+	 */
 
 	*buffer = call_alloc(cs, length * sizeof(CK_BYTE));
 	if (!*buffer)
@@ -884,11 +885,12 @@ static CK_RV rpc_C_Finalize(CallState * cs)
 		if (c->sock == cs->sock)
 			continue ;
 		if (c->req &&
-		    c->req->call_id == GCK_RPC_CALL_C_WaitForSlotEvent) {
-			gck_rpc_log("Sending interuption signal to %d\n",
-                                    ds->socket);
-			if (ds->socket)
-				shutdown(ds->socket, SHUT_RDWR);
+		    (c->req->call_id == GCK_RPC_CALL_C_WaitForSlotEvent)) {
+			gck_rpc_log("Sending interuption signal to %i\n",
+                                    c->sock);
+			if (c->sock != -1)
+				if (shutdown(c->sock, SHUT_RDWR) == 0)
+					c->sock = -1;
 			//pthread_kill(ds->thread, SIGINT);
 		}
 	}
@@ -2203,7 +2205,8 @@ void gck_rpc_layer_accept(void)
 	/* Cleanup any completed dispatch threads */
 	pthread_mutex_lock(&pkcs11_dispatchers_mutex);
 	for (here = &pkcs11_dispatchers, ds = *here; ds != NULL; ds = *here) {
-		if (ds->socket == -1) {
+		CallState *c = &ds->cs;
+		if (c && c->sock == -1) {
 			pthread_join(ds->thread, NULL);
 			*here = ds->next;
 			free(ds);
@@ -2227,7 +2230,6 @@ void gck_rpc_layer_accept(void)
 		return;
 	}
 
-	ds->socket = new_fd;
 	ds->cs.sock = new_fd;
         ds->cs.read = &read_all;
         ds->cs.write = &write_all;
@@ -2295,17 +2297,15 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
 	if (!strncmp("tcp://", prefix, 6)) {
 		int one = 1, port;
 		char *p = NULL;
-		const char *ip;
+		char *ip;
 
 		ip = strdup(prefix + 6);
-		if (ip)
-			p = strchr(ip, ':');
-
-		if (!ip) {
-			gck_rpc_warn("invalid syntax for pkcs11 socket : %s",
-				     prefix);
+		if (ip == NULL) {
+			gck_rpc_warn("out of memory");
 			return -1;
 		}
+
+		p = strchr(ip, ':');
 
 		if (p) {
 			*p = '\0';
@@ -2323,7 +2323,7 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
 
                 if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
                                (char *)&one, sizeof (one)) == -1) {
-                        gck_rpc_warn("couldn't create set pkcs11 "
+                        gck_rpc_warn("couldn't set pkcs11 "
 				 "socket options : %s", strerror (errno));
                         return -1;
                 }
@@ -2331,7 +2331,7 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
 		if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
                                (char *)&one, sizeof(one)) == -1) {
 			gck_rpc_warn
-			    ("couldn't create set pkcs11 socket options : %s",
+			    ("couldn't set pkcs11 socket options : %s",
 			     strerror(errno));
 			return -1;
 		}
@@ -2346,6 +2346,8 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
 
 		snprintf(pkcs11_socket_path, sizeof(pkcs11_socket_path),
 			 "%s", prefix);
+
+		free(ip);
 	} else {
 		snprintf(pkcs11_socket_path, sizeof(pkcs11_socket_path),
 			 "%s/socket.pkcs11", prefix);
@@ -2421,15 +2423,19 @@ void gck_rpc_layer_uninitialize(void)
 	/* Stop all of the dispatch threads */
 	pthread_mutex_lock(&pkcs11_dispatchers_mutex);
 	for (ds = pkcs11_dispatchers; ds; ds = next) {
+		CallState *c = &ds->cs;
 		next = ds->next;
 
 		/* Forcibly shutdown the connection */
-		if (ds->socket)
-			shutdown(ds->socket, SHUT_RDWR);
+		if (c && c->sock != -1)
+			if (shutdown(c->sock, SHUT_RDWR) == 0)
+				c->sock = -1;
+
 		pthread_join(ds->thread, NULL);
 
 		/* This is always closed by dispatch thread */
-		assert(ds->socket == -1);
+		if (c)
+			assert(c->sock == -1);
 		free(ds);
 	}
 	pthread_mutex_unlock(&pkcs11_dispatchers_mutex);
