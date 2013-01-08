@@ -334,13 +334,25 @@ int gck_rpc_message_write_ulong(GckRpcMessage * msg, CK_ULONG val)
 	return egg_buffer_add_uint64(&msg->buffer, val);
 }
 
-int gck_rpc_message_write_byte_buffer(GckRpcMessage * msg, CK_ULONG count)
+int gck_rpc_message_write_byte_buffer(GckRpcMessage * msg, CK_BYTE_PTR arr, CK_ULONG *count_ptr)
 {
+	uint8_t flags;
 	assert(msg);
 
 	/* Make sure this is in the right order */
 	assert(!msg->signature || gck_rpc_message_verify_part(msg, "fy"));
-	return egg_buffer_add_uint32(&msg->buffer, count);
+
+	flags = 0;
+	if (! arr)
+		flags |= GCK_RPC_BYTE_BUFFER_NULL_DATA;
+	if (! count_ptr)
+		flags |= GCK_RPC_BYTE_BUFFER_NULL_COUNT;
+
+	egg_buffer_add_byte(&msg->buffer, flags);
+
+	egg_buffer_add_uint32(&msg->buffer, count_ptr ? *count_ptr : 0x0);
+
+	return !egg_buffer_has_error(&msg->buffer);
 }
 
 int

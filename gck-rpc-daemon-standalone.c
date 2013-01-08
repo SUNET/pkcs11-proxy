@@ -232,9 +232,9 @@ int main(int argc, char *argv[])
 	   if (sock == -1)
 		   exit(1);
 
-	/* Shut down gracefully on SIGTERM. */
-	if (signal (SIGTERM, termination_handler) == SIG_IGN)
-		signal (SIGTERM, SIG_IGN);
+	   /* Shut down gracefully on SIGTERM. */
+	   if (signal (SIGTERM, termination_handler) == SIG_IGN)
+		   signal (SIGTERM, SIG_IGN);
 
 	   is_running = 1;
 	   while (is_running) {

@@ -216,7 +216,7 @@ static const GckRpcCall gck_rpc_calls[] = {
 #endif
 
 #define GCK_RPC_HANDSHAKE \
-	"PRIVATE-GNOME-KEYRING-PKCS11-PROTOCOL-V-1"
+	"PRIVATE-GNOME-KEYRING-PKCS11-PROTOCOL-V-2"
 #define GCK_RPC_HANDSHAKE_LEN \
 	(sizeof (GCK_RPC_HANDSHAKE) - 1)
 
@@ -236,6 +236,9 @@ typedef struct _GckRpcMessage {
 	size_t parsed;
 	const char *sigverify;
 } GckRpcMessage;
+
+#define GCK_RPC_BYTE_BUFFER_NULL_DATA	1
+#define GCK_RPC_BYTE_BUFFER_NULL_COUNT	2
 
 GckRpcMessage *gck_rpc_message_new(EggBufferAllocator allocator);
 
@@ -266,7 +269,7 @@ int gck_rpc_message_write_zero_string(GckRpcMessage * msg,
 int gck_rpc_message_write_space_string(GckRpcMessage * msg,
 				       CK_UTF8CHAR * buffer, CK_ULONG length);
 
-int gck_rpc_message_write_byte_buffer(GckRpcMessage * msg, CK_ULONG count);
+int gck_rpc_message_write_byte_buffer(GckRpcMessage * msg, CK_BYTE_PTR arr, CK_ULONG *count_ptr);
 
 int gck_rpc_message_write_byte_array(GckRpcMessage * msg,
 				     CK_BYTE_PTR arr, CK_ULONG num);

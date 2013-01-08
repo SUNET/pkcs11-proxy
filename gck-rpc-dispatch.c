@@ -80,6 +80,9 @@ static DispatchState *pkcs11_dispatchers = NULL;
 /* A mutex to protect the dispatcher list */
 static pthread_mutex_t pkcs11_dispatchers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* To be able to call C_Finalize from call_uninit. */
+static CK_RV rpc_C_Finalize(CallState *);
+
 /* -----------------------------------------------------------------------------
  * LOGGING and DEBUGGING
  */
@@ -180,6 +183,12 @@ static void call_uninit(CallState * cs)
 {
 	assert(cs);
 
+	/* Close any open sessions. Without this, the application won't be able
+	 * to reconnect (possibly after a crash).
+	 */
+	if (cs->req)
+		rpc_C_Finalize(cs);
+
 	call_reset(cs);
 
 	gck_rpc_message_free(cs->req);
@@ -192,9 +201,10 @@ static void call_uninit(CallState * cs)
 
 static CK_RV
 proto_read_byte_buffer(CallState * cs, CK_BYTE_PTR * buffer,
-		       CK_ULONG * n_buffer)
+		       CK_ULONG_PTR * n_buffer)
 {
 	GckRpcMessage *msg;
+	uint8_t flags;
 	uint32_t length;
 
 	assert(cs);
@@ -206,23 +216,27 @@ proto_read_byte_buffer(CallState * cs, CK_BYTE_PTR * buffer,
 	/* Check that we're supposed to be reading this at this point */
 	assert(!msg->signature || gck_rpc_message_verify_part(msg, "fy"));
 
+	if (!egg_buffer_get_byte
+	    (&msg->buffer, msg->parsed, &msg->parsed, &flags))
+		return PARSE_ERROR;
+
 	/* The number of ulongs there's room for on the other end */
 	if (!egg_buffer_get_uint32
 	    (&msg->buffer, msg->parsed, &msg->parsed, &length))
 		return PARSE_ERROR;
 
-	*n_buffer = length;
-	*buffer = NULL;
 
-	/* We go ahead and allocate a buffer even if length is zero. The code used
-	 * to just return CKR_OK without allocating a buffer, but that breaks a
-	 * test case in pkcs11-tool for C_GenerateRandom of 0 bytes. Best to be as
-	 * transparent as possible and let the p11 module decide how to handle it.
-	 */
+	**n_buffer = length;
+	*buffer = NULL_PTR;
 
-	*buffer = call_alloc(cs, length * sizeof(CK_BYTE));
-	if (!*buffer)
-		return CKR_DEVICE_MEMORY;
+	if ((flags & GCK_RPC_BYTE_BUFFER_NULL_COUNT))
+		*n_buffer = NULL_PTR;
+
+	if (! (flags & GCK_RPC_BYTE_BUFFER_NULL_DATA)) {
+		*buffer = call_alloc(cs, length * sizeof(CK_BYTE));
+		if (!*buffer)
+			return CKR_DEVICE_MEMORY;
+	}
 
 	return CKR_OK;
 }
@@ -248,8 +262,13 @@ proto_read_byte_array(CallState * cs, CK_BYTE_PTR * array, CK_ULONG * n_array)
 		return PARSE_ERROR;
 
 	if (!valid) {
+		uint32_t n_size;
+		/* No array, no data, just length */
+		if (!egg_buffer_get_uint32
+		    (&msg->buffer, msg->parsed, &msg->parsed, &n_size))
+			return PARSE_ERROR;
+		*n_array = (size_t) n_size;
 		*array = NULL;
-		*n_array = 0;
 		return CKR_OK;
 	}
 
@@ -264,7 +283,7 @@ proto_read_byte_array(CallState * cs, CK_BYTE_PTR * array, CK_ULONG * n_array)
 }
 
 static CK_RV
-proto_write_byte_array(CallState * cs, CK_BYTE_PTR array, CK_ULONG len,
+proto_write_byte_array(CallState * cs, CK_BYTE_PTR array, CK_ULONG_PTR len,
 		       CK_RV ret)
 {
 	assert(cs);
@@ -286,7 +305,7 @@ proto_write_byte_array(CallState * cs, CK_BYTE_PTR array, CK_ULONG len,
 		return ret;
 	};
 
-	if (!gck_rpc_message_write_byte_array(cs->resp, array, len))
+	if (!gck_rpc_message_write_byte_array(cs->resp, array, len ? *len : 0))
 		return PREP_ERROR;
 
 	return CKR_OK;
@@ -433,7 +452,7 @@ proto_read_attribute_array(CallState * cs, CK_ATTRIBUTE_PTR * result,
 
 	msg = cs->req;
 
-	/* Make sure this is in the rigth order */
+	/* Make sure this is in the right order */
 	assert(!msg->signature || gck_rpc_message_verify_part(msg, "aA"));
 
 	/* Read the number of attributes */
@@ -548,8 +567,8 @@ static CK_RV proto_read_null_string(CallState * cs, CK_UTF8CHAR_PTR * val)
 	    (&msg->buffer, msg->parsed, &msg->parsed, &data, &n_data))
 		return PARSE_ERROR;
 
-	/* Allocate a block of memory for it */
-	*val = call_alloc(cs, n_data);
+	/* Allocate a block of memory for it. The +1 accomodates the NULL byte. */
+	*val = call_alloc(cs, n_data + 1);
 	if (!*val)
 		return CKR_DEVICE_MEMORY;
 
@@ -702,6 +721,12 @@ static CK_RV proto_write_session_info(CallState * cs, CK_SESSION_INFO_PTR info)
  * CALL MACROS
  */
 
+#define DECLARE_CK_ULONG_PTR(ck_ulong_ptr_name) \
+	CK_ULONG ck_ulong_ptr_name ## _v ; \
+	CK_ULONG_PTR ck_ulong_ptr_name ; \
+	ck_ulong_ptr_name ## _v = 0; \
+	ck_ulong_ptr_name = &ck_ulong_ptr_name ## _v ;
+
 #define BEGIN_CALL(call_id) \
 	debug ((#call_id ": enter")); \
 	assert (cs); \
@@ -717,7 +742,7 @@ static CK_RV proto_write_session_info(CallState * cs, CK_SESSION_INFO_PTR info)
 
 #define END_CALL \
 	_cleanup: \
-		debug (("ret: %d", _ret)); \
+		debug (("ret: 0x%x", _ret)); \
 		return _ret; \
 	}
 
@@ -733,8 +758,8 @@ static CK_RV proto_write_session_info(CallState * cs, CK_SESSION_INFO_PTR info)
 	_ret = proto_read_null_string (cs, &val); \
 	if (_ret != CKR_OK) goto _cleanup;
 
-#define IN_BYTE_BUFFER(buffer, buffer_len) \
-	_ret = proto_read_byte_buffer (cs, &buffer, &buffer_len); \
+#define IN_BYTE_BUFFER(buffer, buffer_len_ptr) \
+	_ret = proto_read_byte_buffer (cs, &buffer, &buffer_len_ptr); \
 	if (_ret != CKR_OK) goto _cleanup;
 
 #define IN_BYTE_ARRAY(buffer, buffer_len) \
@@ -761,9 +786,9 @@ static CK_RV proto_write_session_info(CallState * cs, CK_SESSION_INFO_PTR info)
 	if (_ret == CKR_OK && !gck_rpc_message_write_ulong (cs->resp, val)) \
 		_ret = PREP_ERROR;
 
-#define OUT_BYTE_ARRAY(array, len) \
+#define OUT_BYTE_ARRAY(array, len_ptr) \
 	/* Note how we filter return codes */ \
-	_ret = proto_write_byte_array (cs, array, len, _ret);
+	_ret = proto_write_byte_array (cs, array, len_ptr, _ret);
 
 #define OUT_ULONG_ARRAY(array, len) \
 	/* Note how we filter return codes */ \
@@ -1122,12 +1147,12 @@ static CK_RV rpc_C_GetOperationState(CallState * cs)
 {
 	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR operation_state;
-	CK_ULONG operation_state_len;
+	DECLARE_CK_ULONG_PTR(operation_state_len);
 
 	BEGIN_CALL(C_GetOperationState);
 	IN_ULONG(session);
 	IN_BYTE_BUFFER(operation_state, operation_state_len);
-	PROCESS_CALL((session, operation_state, &operation_state_len));
+	PROCESS_CALL((session, operation_state, operation_state_len));
 	OUT_BYTE_ARRAY(operation_state, operation_state_len);
 	END_CALL;
 }
@@ -1327,14 +1352,14 @@ static CK_RV rpc_C_Encrypt(CallState * cs)
 	CK_BYTE_PTR data;
 	CK_ULONG data_len;
 	CK_BYTE_PTR encrypted_data;
-	CK_ULONG encrypted_data_len;
+	DECLARE_CK_ULONG_PTR(encrypted_data_len);
 
 	BEGIN_CALL(C_Encrypt);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_BUFFER(encrypted_data, encrypted_data_len);
 	PROCESS_CALL((session, data, data_len, encrypted_data,
-		      &encrypted_data_len));
+		      encrypted_data_len));
 	OUT_BYTE_ARRAY(encrypted_data, encrypted_data_len);
 	END_CALL;
 }
@@ -1345,14 +1370,14 @@ static CK_RV rpc_C_EncryptUpdate(CallState * cs)
 	CK_BYTE_PTR part;
 	CK_ULONG part_len;
 	CK_BYTE_PTR encrypted_part;
-	CK_ULONG encrypted_part_len;
+	DECLARE_CK_ULONG_PTR(encrypted_part_len);
 
 	BEGIN_CALL(C_EncryptUpdate);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(part, part_len);
 	IN_BYTE_BUFFER(encrypted_part, encrypted_part_len);
 	PROCESS_CALL((session, part, part_len, encrypted_part,
-		      &encrypted_part_len));
+		      encrypted_part_len));
 	OUT_BYTE_ARRAY(encrypted_part, encrypted_part_len);
 	END_CALL;
 }
@@ -1361,12 +1386,12 @@ static CK_RV rpc_C_EncryptFinal(CallState * cs)
 {
 	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR last_encrypted_part;
-	CK_ULONG last_encrypted_part_len;
+	DECLARE_CK_ULONG_PTR(last_encrypted_part_len);
 
 	BEGIN_CALL(C_EncryptFinal);
 	IN_ULONG(session);
 	IN_BYTE_BUFFER(last_encrypted_part, last_encrypted_part_len);
-	PROCESS_CALL((session, last_encrypted_part, &last_encrypted_part_len));
+	PROCESS_CALL((session, last_encrypted_part, last_encrypted_part_len));
 	OUT_BYTE_ARRAY(last_encrypted_part, last_encrypted_part_len);
 	END_CALL;
 }
@@ -1391,14 +1416,14 @@ static CK_RV rpc_C_Decrypt(CallState * cs)
 	CK_BYTE_PTR encrypted_data;
 	CK_ULONG encrypted_data_len;
 	CK_BYTE_PTR data;
-	CK_ULONG data_len;
+	DECLARE_CK_ULONG_PTR(data_len);
 
 	BEGIN_CALL(C_Decrypt);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(encrypted_data, encrypted_data_len);
 	IN_BYTE_BUFFER(data, data_len);
 	PROCESS_CALL((session, encrypted_data, encrypted_data_len, data,
-		      &data_len));
+		      data_len));
 	OUT_BYTE_ARRAY(data, data_len);
 	END_CALL;
 }
@@ -1409,14 +1434,14 @@ static CK_RV rpc_C_DecryptUpdate(CallState * cs)
 	CK_BYTE_PTR encrypted_part;
 	CK_ULONG encrypted_part_len;
 	CK_BYTE_PTR part;
-	CK_ULONG part_len;
+	DECLARE_CK_ULONG_PTR(part_len);
 
 	BEGIN_CALL(C_DecryptUpdate);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(encrypted_part, encrypted_part_len);
 	IN_BYTE_BUFFER(part, part_len);
 	PROCESS_CALL((session, encrypted_part, encrypted_part_len, part,
-		      &part_len));
+		      part_len));
 	OUT_BYTE_ARRAY(part, part_len);
 	END_CALL;
 }
@@ -1425,12 +1450,12 @@ static CK_RV rpc_C_DecryptFinal(CallState * cs)
 {
 	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR last_part;
-	CK_ULONG last_part_len;
+	DECLARE_CK_ULONG_PTR(last_part_len);
 
 	BEGIN_CALL(C_DecryptFinal);
 	IN_ULONG(session);
 	IN_BYTE_BUFFER(last_part, last_part_len);
-	PROCESS_CALL((session, last_part, &last_part_len));
+	PROCESS_CALL((session, last_part, last_part_len));
 	OUT_BYTE_ARRAY(last_part, last_part_len);
 	END_CALL;
 }
@@ -1453,13 +1478,13 @@ static CK_RV rpc_C_Digest(CallState * cs)
 	CK_BYTE_PTR data;
 	CK_ULONG data_len;
 	CK_BYTE_PTR digest;
-	CK_ULONG digest_len;
+	DECLARE_CK_ULONG_PTR(digest_len);
 
 	BEGIN_CALL(C_Digest);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_BUFFER(digest, digest_len);
-	PROCESS_CALL((session, data, data_len, digest, &digest_len));
+	PROCESS_CALL((session, data, data_len, digest, digest_len));
 	OUT_BYTE_ARRAY(digest, digest_len);
 	END_CALL;
 }
@@ -1493,12 +1518,12 @@ static CK_RV rpc_C_DigestFinal(CallState * cs)
 {
 	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR digest;
-	CK_ULONG digest_len;
+	DECLARE_CK_ULONG_PTR(digest_len);
 
 	BEGIN_CALL(C_DigestFinal);
 	IN_ULONG(session);
 	IN_BYTE_BUFFER(digest, digest_len);
-	PROCESS_CALL((session, digest, &digest_len));
+	PROCESS_CALL((session, digest, digest_len));
 	OUT_BYTE_ARRAY(digest, digest_len);
 	END_CALL;
 }
@@ -1523,13 +1548,13 @@ static CK_RV rpc_C_Sign(CallState * cs)
 	CK_BYTE_PTR part;
 	CK_ULONG part_len;
 	CK_BYTE_PTR signature;
-	CK_ULONG signature_len;
+	DECLARE_CK_ULONG_PTR(signature_len);
 
 	BEGIN_CALL(C_Sign);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(part, part_len);
 	IN_BYTE_BUFFER(signature, signature_len);
-	PROCESS_CALL((session, part, part_len, signature, &signature_len));
+	PROCESS_CALL((session, part, part_len, signature, signature_len));
 	OUT_BYTE_ARRAY(signature, signature_len);
 	END_CALL;
 
@@ -1552,12 +1577,12 @@ static CK_RV rpc_C_SignFinal(CallState * cs)
 {
 	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR signature;
-	CK_ULONG signature_len;
+	DECLARE_CK_ULONG_PTR(signature_len);
 
 	BEGIN_CALL(C_SignFinal);
 	IN_ULONG(session);
 	IN_BYTE_BUFFER(signature, signature_len);
-	PROCESS_CALL((session, signature, &signature_len));
+	PROCESS_CALL((session, signature, signature_len));
 	OUT_BYTE_ARRAY(signature, signature_len);
 	END_CALL;
 }
@@ -1582,13 +1607,13 @@ static CK_RV rpc_C_SignRecover(CallState * cs)
 	CK_BYTE_PTR data;
 	CK_ULONG data_len;
 	CK_BYTE_PTR signature;
-	CK_ULONG signature_len;
+	DECLARE_CK_ULONG_PTR(signature_len);
 
 	BEGIN_CALL(C_SignRecover);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_BUFFER(signature, signature_len);
-	PROCESS_CALL((session, data, data_len, signature, &signature_len));
+	PROCESS_CALL((session, data, data_len, signature, signature_len));
 	OUT_BYTE_ARRAY(signature, signature_len);
 	END_CALL;
 }
@@ -1669,13 +1694,13 @@ static CK_RV rpc_C_VerifyRecover(CallState * cs)
 	CK_BYTE_PTR signature;
 	CK_ULONG signature_len;
 	CK_BYTE_PTR data;
-	CK_ULONG data_len;
+	DECLARE_CK_ULONG_PTR(data_len);
 
 	BEGIN_CALL(C_VerifyRecover);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(signature, signature_len);
 	IN_BYTE_BUFFER(data, data_len);
-	PROCESS_CALL((session, signature, signature_len, data, &data_len));
+	PROCESS_CALL((session, signature, signature_len, data, data_len));
 	OUT_BYTE_ARRAY(data, data_len);
 	END_CALL;
 }
@@ -1686,14 +1711,14 @@ static CK_RV rpc_C_DigestEncryptUpdate(CallState * cs)
 	CK_BYTE_PTR part;
 	CK_ULONG part_len;
 	CK_BYTE_PTR encrypted_part;
-	CK_ULONG encrypted_part_len;
+	DECLARE_CK_ULONG_PTR(encrypted_part_len);
 
 	BEGIN_CALL(C_DigestEncryptUpdate);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(part, part_len);
 	IN_BYTE_BUFFER(encrypted_part, encrypted_part_len);
 	PROCESS_CALL((session, part, part_len, encrypted_part,
-		      &encrypted_part_len));
+		      encrypted_part_len));
 	OUT_BYTE_ARRAY(encrypted_part, encrypted_part_len);
 	END_CALL;
 }
@@ -1704,14 +1729,14 @@ static CK_RV rpc_C_DecryptDigestUpdate(CallState * cs)
 	CK_BYTE_PTR encrypted_part;
 	CK_ULONG encrypted_part_len;
 	CK_BYTE_PTR part;
-	CK_ULONG part_len;
+	DECLARE_CK_ULONG_PTR(part_len);
 
 	BEGIN_CALL(C_DecryptDigestUpdate);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(encrypted_part, encrypted_part_len);
 	IN_BYTE_BUFFER(part, part_len);
 	PROCESS_CALL((session, encrypted_part, encrypted_part_len, part,
-		      &part_len));
+		      part_len));
 	OUT_BYTE_ARRAY(part, part_len);
 	END_CALL;
 }
@@ -1722,14 +1747,14 @@ static CK_RV rpc_C_SignEncryptUpdate(CallState * cs)
 	CK_BYTE_PTR part;
 	CK_ULONG part_len;
 	CK_BYTE_PTR encrypted_part;
-	CK_ULONG encrypted_part_len;
+	DECLARE_CK_ULONG_PTR(encrypted_part_len);
 
 	BEGIN_CALL(C_SignEncryptUpdate);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(part, part_len);
 	IN_BYTE_BUFFER(encrypted_part, encrypted_part_len);
 	PROCESS_CALL((session, part, part_len, encrypted_part,
-		      &encrypted_part_len));
+		      encrypted_part_len));
 	OUT_BYTE_ARRAY(encrypted_part, encrypted_part_len);
 	END_CALL;
 }
@@ -1740,14 +1765,14 @@ static CK_RV rpc_C_DecryptVerifyUpdate(CallState * cs)
 	CK_BYTE_PTR encrypted_part;
 	CK_ULONG encrypted_part_len;
 	CK_BYTE_PTR part;
-	CK_ULONG part_len;
+	DECLARE_CK_ULONG_PTR(part_len);
 
 	BEGIN_CALL(C_DecryptVerifyUpdate);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(encrypted_part, encrypted_part_len);
 	IN_BYTE_BUFFER(part, part_len);
 	PROCESS_CALL((session, encrypted_part, encrypted_part_len, part,
-		      &part_len));
+		      part_len));
 	OUT_BYTE_ARRAY(part, part_len);
 	END_CALL;
 }
@@ -1805,7 +1830,7 @@ static CK_RV rpc_C_WrapKey(CallState * cs)
 	CK_OBJECT_HANDLE wrapping_key;
 	CK_OBJECT_HANDLE key;
 	CK_BYTE_PTR wrapped_key;
-	CK_ULONG wrapped_key_len;
+	DECLARE_CK_ULONG_PTR(wrapped_key_len);
 
 	BEGIN_CALL(C_WrapKey);
 	IN_ULONG(session);
@@ -1814,7 +1839,7 @@ static CK_RV rpc_C_WrapKey(CallState * cs)
 	IN_ULONG(key);
 	IN_BYTE_BUFFER(wrapped_key, wrapped_key_len);
 	PROCESS_CALL((session, &mechanism, wrapping_key, key, wrapped_key,
-		      &wrapped_key_len));
+		      wrapped_key_len));
 	OUT_BYTE_ARRAY(wrapped_key, wrapped_key_len);
 	END_CALL;
 }
@@ -1879,12 +1904,12 @@ static CK_RV rpc_C_GenerateRandom(CallState * cs)
 {
 	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR random_data;
-	CK_ULONG random_len;
+	DECLARE_CK_ULONG_PTR(random_len);
 
 	BEGIN_CALL(C_GenerateRandom);
 	IN_ULONG(session);
 	IN_BYTE_BUFFER(random_data, random_len);
-	PROCESS_CALL((session, random_data, random_len));
+	PROCESS_CALL((session, random_data, *random_len));
 	OUT_BYTE_ARRAY(random_data, random_len);
 	END_CALL;
 }
