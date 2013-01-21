@@ -170,6 +170,7 @@ int main(int argc, char *argv[])
 	fd_set read_fds;
 	int sock, ret;
 	CK_RV rv;
+	CK_C_INITIALIZE_ARGS init_args;
 
 
         if (install_syscall_reporter())
@@ -212,7 +213,10 @@ int main(int argc, char *argv[])
 	}
 
 	/* RPC layer expects initialized module */
-	rv = (funcs->C_Initialize) (NULL /* &p11_init_args */);
+	memset(&init_args, 0, sizeof(init_args));
+	init_args.flags = CKF_OS_LOCKING_OK;
+
+	rv = (funcs->C_Initialize) (&init_args);
 	if (rv != CKR_OK) {
 		fprintf(stderr, "couldn't initialize module: %s: 0x%08x\n",
 			argv[1], (int)rv);

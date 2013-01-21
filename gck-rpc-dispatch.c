@@ -40,6 +40,8 @@
 # include <arpa/inet.h>
 # include <netinet/in.h>
 # include <netinet/tcp.h>
+# include <sys/types.h>
+# include <netdb.h>
 #endif
 #include <pthread.h>
 
@@ -57,6 +59,11 @@ static CK_FUNCTION_LIST_PTR pkcs11_module = NULL;
 #define PARSE_ERROR CKR_DEVICE_ERROR
 #define PREP_ERROR  CKR_DEVICE_MEMORY
 
+typedef struct {
+	CK_SESSION_HANDLE id;
+	CK_SLOT_ID slot;
+} SessionState;
+
 typedef struct _CallState {
 	GckRpcMessage *req;
 	GckRpcMessage *resp;
@@ -66,6 +73,12 @@ typedef struct _CallState {
 	int sock;
         int (*read)(int, unsigned char *,size_t);
         int (*write)(int, unsigned char *,size_t);
+	struct sockaddr_storage addr;
+	socklen_t addrlen;
+	/* XXX Maybe sessions should be a linked list instead, to remove the hard
+	 * upper limit and reduce typical memory use.
+	 */
+	SessionState sessions[PKCS11PROXY_MAX_SESSION_COUNT];
 } CallState;
 
 typedef struct _DispatchState {
@@ -460,6 +473,16 @@ proto_read_attribute_array(CallState * cs, CK_ATTRIBUTE_PTR * result,
 	    (&msg->buffer, msg->parsed, &msg->parsed, &n_attrs))
 		return PARSE_ERROR;
 
+	if (! n_attrs) {
+		/* If there are no attributes, it makes most sense to make result
+		 * a NULL pointer. What use could one have of a potentially dangling
+		 * pointer anyways?
+		 */
+		*result = NULL_PTR;
+		*n_result = n_attrs;
+		return CKR_OK;
+	}
+
 	/* Allocate memory for the attribute structures */
 	attrs = call_alloc(cs, n_attrs * sizeof(CK_ATTRIBUTE));
 	if (!attrs)
@@ -549,7 +572,7 @@ proto_write_attribute_array(CallState * cs, CK_ATTRIBUTE_PTR array,
 	return CKR_OK;
 }
 
-static CK_RV proto_read_null_string(CallState * cs, CK_UTF8CHAR_PTR * val)
+static CK_RV proto_read_space_string(CallState * cs, CK_UTF8CHAR_PTR * val, CK_ULONG length)
 {
 	GckRpcMessage *msg;
 	const unsigned char *data;
@@ -561,19 +584,18 @@ static CK_RV proto_read_null_string(CallState * cs, CK_UTF8CHAR_PTR * val)
 	msg = cs->req;
 
 	/* Check that we're supposed to have this at this point */
-	assert(!msg->signature || gck_rpc_message_verify_part(msg, "z"));
+	assert(!msg->signature || gck_rpc_message_verify_part(msg, "s"));
 
 	if (!egg_buffer_get_byte_array
 	    (&msg->buffer, msg->parsed, &msg->parsed, &data, &n_data))
 		return PARSE_ERROR;
 
-	/* Allocate a block of memory for it. The +1 accomodates the NULL byte. */
-	*val = call_alloc(cs, n_data + 1);
+	/* Allocate a block of memory for it. */
+	*val = call_alloc(cs, n_data);
 	if (!*val)
 		return CKR_DEVICE_MEMORY;
 
 	memcpy(*val, data, n_data);
-	(*val)[n_data] = 0;
 
 	return CKR_OK;
 }
@@ -754,8 +776,8 @@ static CK_RV proto_write_session_info(CallState * cs, CK_SESSION_INFO_PTR info)
 	if (!gck_rpc_message_read_ulong (cs->req, &val)) \
 		{ _ret = PARSE_ERROR; goto _cleanup; }
 
-#define IN_STRING(val) \
-	_ret = proto_read_null_string (cs, &val); \
+#define IN_SPACE_STRING(val, len)			   \
+	_ret = proto_read_space_string (cs, &val, len);	   \
 	if (_ret != CKR_OK) goto _cleanup;
 
 #define IN_BYTE_BUFFER(buffer, buffer_len_ptr) \
@@ -838,6 +860,7 @@ static CK_RV rpc_C_Initialize(CallState * cs)
 
 		/* Check to make sure the header matches */
 		if (n_handshake != GCK_RPC_HANDSHAKE_LEN ||
+		    handshake == NULL_PTR ||
 		    memcmp(handshake, GCK_RPC_HANDSHAKE, n_handshake) != 0) {
 			gck_rpc_warn
 			    ("invalid handshake received from connecting module");
@@ -858,9 +881,7 @@ static CK_RV rpc_C_Initialize(CallState * cs)
 
 static CK_RV rpc_C_Finalize(CallState * cs)
 {
-	CK_SLOT_ID_PTR slots;
-	CK_ULONG n_slots, i;
-	CK_SLOT_ID appartment;
+	CK_ULONG i;
 	CK_RV ret;
 	DispatchState *ds, *next;
 
@@ -874,27 +895,17 @@ static CK_RV rpc_C_Finalize(CallState * cs)
 	 * We don't actually C_Finalize lower layers, since this would finalize
 	 * for all appartments, client applications. Anyway this is done by
 	 * the code that loaded us.
-	 *
-	 * But we do need to cleanup resources used by this client, so instead
-	 * we call C_CloseAllSessions for each appartment for this client.
 	 */
 
-	ret = (pkcs11_module->C_GetSlotList) (TRUE, NULL, &n_slots);
-	if (ret == CKR_OK) {
-		slots = calloc(n_slots, sizeof(CK_SLOT_ID));
-		if (slots == NULL) {
-			ret = CKR_DEVICE_MEMORY;
-		} else {
-			ret =
-			    (pkcs11_module->C_GetSlotList) (TRUE, slots,
-							    &n_slots);
-			for (i = 0; ret == CKR_OK && i < n_slots; ++i) {
-				appartment = slots[i];
-				ret =
-				    (pkcs11_module->
-				     C_CloseAllSessions) (appartment);
-			}
-			free(slots);
+	/* Close all sessions that have been opened by this thread, regardless of slot */
+	for (i = 0; i < PKCS11PROXY_MAX_SESSION_COUNT; i++) {
+		if (cs->sessions[i].id) {
+			gck_rpc_log("Closing session %li on position %i", cs->sessions[i].id, i);
+
+			ret = (pkcs11_module->C_CloseSession) (cs->sessions[i].id);
+			if (ret != CKR_OK)
+				break;
+			cs->sessions[i].id = 0;
 		}
 	}
 
@@ -1021,7 +1032,7 @@ static CK_RV rpc_C_InitToken(CallState * cs)
 	BEGIN_CALL(C_InitToken);
 	IN_ULONG(slot_id);
 	IN_BYTE_ARRAY(pin, pin_len);
-	IN_STRING(label);
+	IN_SPACE_STRING(label, 32);
 	PROCESS_CALL((slot_id, pin, pin_len, label));
 	END_CALL;
 }
@@ -1053,6 +1064,21 @@ static CK_RV rpc_C_OpenSession(CallState * cs)
 	IN_ULONG(slot_id);
 	IN_ULONG(flags);
 	PROCESS_CALL((slot_id, flags, NULL, NULL, &session));
+	if (_ret == CKR_OK) {
+		int i;
+		/* Remember this thread opened this session. Needed for C_CloseAllSessions. */
+		for (i = 0; i < PKCS11PROXY_MAX_SESSION_COUNT; i++) {
+			if (! cs->sessions[i].id) {
+				cs->sessions[i].id = session;
+				cs->sessions[i].slot = slot_id;
+				gck_rpc_log("Session %li stored in position %i", session, i);
+				break;
+			}
+		}
+		if (i == PKCS11PROXY_MAX_SESSION_COUNT) {
+			_ret = CKR_SESSION_COUNT; goto _cleanup;
+		}
+	}
 	OUT_ULONG(session);
 	END_CALL;
 }
@@ -1064,18 +1090,61 @@ static CK_RV rpc_C_CloseSession(CallState * cs)
 	BEGIN_CALL(C_CloseSession);
 	IN_ULONG(session);
 	PROCESS_CALL((session));
+	if (_ret == CKR_OK) {
+		int i;
+		/* Remove this session from this threads list */
+		for (i = 0; i < PKCS11PROXY_MAX_SESSION_COUNT; i++) {
+			if (cs->sessions[i].id == session) {
+				gck_rpc_log("Session %li removed from position %i", session, i);
+				cs->sessions[i].id = 0;
+				break;
+			}
+		}
+		if (i == PKCS11PROXY_MAX_SESSION_COUNT) {
+			/* Ignore errors, like with close() */
+			gck_rpc_log("C_CloseSession on unknown session");
+		}
+	}
 	END_CALL;
 }
 
 static CK_RV rpc_C_CloseAllSessions(CallState * cs)
 {
 	CK_SLOT_ID slot_id;
+	CK_SLOT_INFO slotInfo;
+	int i;
 
-	/* Slot id becomes appartment so lower layers can tell clients apart. */
+	/* Close all sessions that have been opened by this thread. PKCS#11 (v2.2) says
+	 * C_CloseAllSessions closes all the sessions opened by one application, leaving
+	 * sessions opened by other applications alone even if the sessions share slot.
+	 *
+	 * Each application on the client side of pkcs11-proxy will mean different thread
+	 * on the server side, so we should close all sessions for a slot opened in this
+	 * thread.
+	 */
 
 	BEGIN_CALL(C_CloseAllSessions);
 	IN_ULONG(slot_id);
-	PROCESS_CALL((slot_id));
+
+	/* To emulate real C_CloseAllSessions (well, the SoftHSM one) we check if slot_id is valid. */
+	_ret = pkcs11_module->C_GetSlotInfo(slot_id, &slotInfo);
+	if (_ret != CKR_OK)
+		goto _cleanup;
+
+	for (i = 0; i < PKCS11PROXY_MAX_SESSION_COUNT; i++) {
+		if (cs->sessions[i].id && (cs->sessions[i].slot == slot_id)) {
+			gck_rpc_log("Closing session %li on position %i with slot %i", cs->sessions[i].id, i, slot_id);
+
+			_ret = (pkcs11_module->C_CloseSession) (cs->sessions[i].id);
+			if (_ret == CKR_OK ||
+			    _ret == CKR_SESSION_CLOSED ||
+			    _ret == CKR_SESSION_HANDLE_INVALID) {
+				cs->sessions[i].id = 0;
+			}
+			if (_ret != CKR_OK)
+				goto _cleanup;
+		}
+	}
 	END_CALL;
 }
 
@@ -1909,6 +1978,9 @@ static CK_RV rpc_C_GenerateRandom(CallState * cs)
 	BEGIN_CALL(C_GenerateRandom);
 	IN_ULONG(session);
 	IN_BYTE_BUFFER(random_data, random_len);
+	if (random_len == NULL_PTR) {
+		_ret = PARSE_ERROR; goto _cleanup;
+	}
 	PROCESS_CALL((session, random_data, *random_len));
 	OUT_BYTE_ARRAY(random_data, random_len);
 	END_CALL;
@@ -2127,17 +2199,27 @@ static int write_all(int sock, unsigned char *data, size_t len)
 static void run_dispatch_loop(CallState *cs)
 {
 	unsigned char buf[4];
-	uint32_t len;
+	uint32_t len, res;
+	char hoststr[NI_MAXHOST], portstr[NI_MAXSERV];
 
 	assert(cs->sock != -1);
+
+	if ((res = getnameinfo((struct sockaddr *) & cs->addr, cs->addrlen,
+			       hoststr, sizeof(hoststr), portstr, sizeof(portstr),
+			       NI_NUMERICHOST | NI_NUMERICSERV)) != 0) {
+		gck_rpc_warn("couldn't call getnameinfo on client addr: %.100s",
+			     gai_strerror(res));
+		hoststr[0] = portstr[0] = '\0';
+	}
 
 	/* The client application */
 	if (!cs->read(cs->sock, (unsigned char *)&cs->appid, sizeof (cs->appid))) {
 		gck_rpc_warn("Can't read appid\n");
 		return ;
 	}
-	gck_rpc_log("New session %d-%d\n", (uint32_t) (cs->appid >> 32),
-		    (uint32_t) cs->appid);
+
+	gck_rpc_log("New session %d-%d (client %s, port %s)\n", (uint32_t) (cs->appid >> 32),
+		    (uint32_t) cs->appid, hoststr, portstr);
 
 	/* Setup our buffers */
 	if (!call_init(cs)) {
@@ -2219,7 +2301,7 @@ static char pkcs11_socket_path[MAXPATHLEN] = { 0, };
 
 void gck_rpc_layer_accept(void)
 {
-	struct sockaddr_un addr;
+	struct sockaddr_storage addr;
 	DispatchState *ds, **here;
 	int error;
 	socklen_t addrlen;
@@ -2258,6 +2340,8 @@ void gck_rpc_layer_accept(void)
 	ds->cs.sock = new_fd;
         ds->cs.read = &read_all;
         ds->cs.write = &write_all;
+	ds->cs.addr = addr;
+	ds->cs.addrlen = addrlen;
 
 	error = pthread_create(&ds->thread, NULL,
 			       run_dispatch_thread, &(ds->cs));
@@ -2285,6 +2369,99 @@ void gck_rpc_layer_inetd(CK_FUNCTION_LIST_PTR module)
    pkcs11_module = module;
 
    run_dispatch_thread(&cs);
+}
+
+/*
+ * Try to get a listening socket for host and port (host may be either a name or
+ * an IP address, as string) and port (a string with a service name or a port
+ * number).
+ *
+ * Returns -1 on failure, and the socket fd otherwise.
+ */
+static int _get_listening_socket(char *host, char *port)
+{
+	char hoststr[NI_MAXHOST], portstr[NI_MAXSERV];
+	struct addrinfo *ai, *first, hints;
+	int res, sock, one = 1;
+
+	memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_flags = AI_PASSIVE;		/* Want addr for bind() */
+	hints.ai_family = AF_UNSPEC;		/* Either IPv4 or IPv6 */
+	hints.ai_socktype = SOCK_STREAM;	/* Only stream oriented sockets */
+
+	if ((res = getaddrinfo(host, port, &hints, &ai)) < 0) {
+		gck_rpc_warn("couldn't resolve host '%.100s' or service '%.100s' : %.100s\n",
+			     host, port, gai_strerror(res));
+		return -1;
+	}
+
+	sock = -1;
+	first = ai;
+
+	/* Loop through the sockets returned and see if we can find one that accepts
+	 * our options and bind()
+	 */
+	while (ai) {
+		sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+
+		if (sock >= 0) {
+			if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+				       (char *)&one, sizeof (one)) == -1) {
+				gck_rpc_warn("couldn't set pkcs11 "
+					     "socket protocol options (%.100s %.100s): %.100s",
+					     host, port, strerror (errno));
+				goto next;
+			}
+
+			if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+				       (char *)&one, sizeof(one)) == -1) {
+				gck_rpc_warn
+					("couldn't set pkcs11 socket options (%.100s %.100s): %.100s",
+					 host, port, strerror(errno));
+				goto next;
+			}
+
+			if (bind(sock, ai->ai_addr, ai->ai_addrlen) == 0)
+				break;
+
+		next:
+			close(sock);
+			sock = -1;
+		}
+		ai = ai->ai_next;
+	}
+
+	if (sock < 0) {
+		gck_rpc_warn("couldn't create pkcs11 socket (%.100s %.100s): %.100s\n",
+			     host, port, strerror(errno));
+		sock = -1;
+		goto out;
+	}
+
+	if (listen(sock, PKCS11PROXY_LISTEN_BACKLOG) < 0) {
+		gck_rpc_warn("couldn't listen on pkcs11 socket (%.100s %.100s): %.100s",
+			     host, port, strerror(errno));
+		sock = -1;
+		goto out;
+	}
+
+	/* Format a string describing the socket we're listening on into pkcs11_socket_path */
+	if ((res = getnameinfo(ai->ai_addr, ai->ai_addrlen,
+			       hoststr, sizeof(hoststr), portstr, sizeof(portstr),
+			       NI_NUMERICHOST | NI_NUMERICSERV)) != 0) {
+		gck_rpc_warn("couldn't call getnameinfo on pkcs11 socket (%.100s %.100s): %.100s",
+			     host, port, gai_strerror(res));
+		sock = -1;
+		goto out;
+	}
+
+	snprintf(pkcs11_socket_path, sizeof(pkcs11_socket_path),
+		 (ai->ai_family == AF_INET6) ? "[%s]:%s" : "%s:%s", hoststr, portstr);
+
+ out:
+	freeaddrinfo(first);
+
+	return sock;
 }
 
 int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
@@ -2320,60 +2497,26 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
 #endif
 
 	if (!strncmp("tcp://", prefix, 6)) {
-		int one = 1, port;
-		char *p = NULL;
-		char *ip;
+		/*
+		 * TCP socket
+		 */
+		char *host, *port;
 
-		ip = strdup(prefix + 6);
-		if (ip == NULL) {
-			gck_rpc_warn("out of memory");
+		if (! gck_rpc_parse_host_port(prefix + 6, &host, &port)) {
+			free(host);
 			return -1;
 		}
 
-		p = strchr(ip, ':');
-
-		if (p) {
-			*p = '\0';
-			port = strtol(p + 1, NULL, 0);
-		} else
-			port = 0;
-
-		sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
-		if (sock < 0) {
-			gck_rpc_warn("couldn't create pkcs11 socket: %s",
-				     strerror(errno));
+		if ((sock = _get_listening_socket(host, port)) == -1) {
+			free(host);
 			return -1;
 		}
 
-                if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
-                               (char *)&one, sizeof (one)) == -1) {
-                        gck_rpc_warn("couldn't set pkcs11 "
-				 "socket options : %s", strerror (errno));
-                        return -1;
-                }
-
-		if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
-                               (char *)&one, sizeof(one)) == -1) {
-			gck_rpc_warn
-			    ("couldn't set pkcs11 socket options : %s",
-			     strerror(errno));
-			return -1;
-		}
-
-		addr.sun_family = AF_INET;
-		if (inet_aton(ip, &((struct sockaddr_in *)&addr)->sin_addr) ==
-		    0) {
-			gck_rpc_warn("bad inet address : %s", ip);
-			return -1;
-		}
-		((struct sockaddr_in *)&addr)->sin_port = htons(port);
-
-		snprintf(pkcs11_socket_path, sizeof(pkcs11_socket_path),
-			 "%s", prefix);
-
-		free(ip);
+		free(host);
 	} else {
+		/*
+		 * UNIX domain socket
+		 */
 		snprintf(pkcs11_socket_path, sizeof(pkcs11_socket_path),
 			 "%s/socket.pkcs11", prefix);
 
@@ -2389,34 +2532,18 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
 		unlink(pkcs11_socket_path);
 		strncpy(addr.sun_path, pkcs11_socket_path,
 			sizeof(addr.sun_path));
-	}
 
-	if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		gck_rpc_warn("couldn't bind to pkcs11 socket: %s: %s",
-			     pkcs11_socket_path, strerror(errno));
-		return -1;
-	}
-
-	if (listen(sock, 128) < 0) {
-		gck_rpc_warn("couldn't listen on pkcs11 socket: %s: %s",
-			     pkcs11_socket_path, strerror(errno));
-		return -1;
-	}
-
-	if (!strncmp("tcp://", prefix, 6)) {
-		struct sockaddr_in sa;
-		socklen_t sa_len;
-
-		sa_len = sizeof(sa);
-
-		if (getsockname(sock, (struct sockaddr *)&sa, &sa_len) == -1) {
-			gck_rpc_warn("getsockname failed on pkcs11 socket: %s: %s",
+		if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+			gck_rpc_warn("couldn't bind to pkcs11 socket: %s: %s",
 				     pkcs11_socket_path, strerror(errno));
 			return -1;
 		}
 
-		snprintf(pkcs11_socket_path, sizeof(pkcs11_socket_path),
-			 "%s:%d", inet_ntoa(sa.sin_addr), ntohs(sa.sin_port));
+		if (listen(sock, PKCS11PROXY_LISTEN_BACKLOG) < 0) {
+			gck_rpc_warn("couldn't listen on pkcs11 socket: %s: %s",
+				     pkcs11_socket_path, strerror(errno));
+			return -1;
+		}
 	}
 
 	gck_rpc_log("Listening on: %s\n", pkcs11_socket_path);

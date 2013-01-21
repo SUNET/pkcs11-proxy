@@ -130,7 +130,6 @@ typedef struct _GckRpcCall {
  *  s  = space padded string
  *  v  = CK_VERSION
  *  y  = CK_BYTE
- *  z  = null terminated string
  */
 
 static const GckRpcCall gck_rpc_calls[] = {
@@ -144,7 +143,7 @@ static const GckRpcCall gck_rpc_calls[] = {
 	 "ssssuuuuuuuuuuuvvs"},
 	{GCK_RPC_CALL_C_GetMechanismList, "C_GetMechanismList", "ufu", "au"},
 	{GCK_RPC_CALL_C_GetMechanismInfo, "C_GetMechanismInfo", "uu", "uuu"},
-	{GCK_RPC_CALL_C_InitToken, "C_InitToken", "uayz", ""},
+	{GCK_RPC_CALL_C_InitToken, "C_InitToken", "uays", ""},
 	{GCK_RPC_CALL_C_WaitForSlotEvent, "C_WaitForSlotEvent", "u", "u"},
 	{GCK_RPC_CALL_C_OpenSession, "C_OpenSession", "uu", "u"},
 	{GCK_RPC_CALL_C_CloseSession, "C_CloseSession", "u", ""},
@@ -216,7 +215,7 @@ static const GckRpcCall gck_rpc_calls[] = {
 #endif
 
 #define GCK_RPC_HANDSHAKE \
-	"PRIVATE-GNOME-KEYRING-PKCS11-PROTOCOL-V-2"
+	"PRIVATE-GNOME-KEYRING-PKCS11-PROTOCOL-V-3"
 #define GCK_RPC_HANDSHAKE_LEN \
 	(sizeof (GCK_RPC_HANDSHAKE) - 1)
 
@@ -262,9 +261,6 @@ int gck_rpc_message_verify_part(GckRpcMessage * msg, const char *part);
 int gck_rpc_message_write_byte(GckRpcMessage * msg, CK_BYTE val);
 
 int gck_rpc_message_write_ulong(GckRpcMessage * msg, CK_ULONG val);
-
-int gck_rpc_message_write_zero_string(GckRpcMessage * msg,
-				      CK_UTF8CHAR * string);
 
 int gck_rpc_message_write_space_string(GckRpcMessage * msg,
 				       CK_UTF8CHAR * buffer, CK_ULONG length);
@@ -327,5 +323,8 @@ int gck_rpc_mechanism_has_sane_parameters(CK_MECHANISM_TYPE type);
 int gck_rpc_mechanism_has_no_parameters(CK_MECHANISM_TYPE mech);
 int gck_rpc_has_bad_sized_ulong_parameter(CK_ATTRIBUTE_PTR attr);
 int gck_rpc_has_ulong_parameter(CK_ATTRIBUTE_TYPE type);
+
+/* Parses strings (prefix) to host and port components. */
+int gck_rpc_parse_host_port(const char *prefix, char **host, char **port);
 
 #endif /* GCK_RPC_CALLS_H */
