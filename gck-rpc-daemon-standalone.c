@@ -26,6 +26,7 @@
 #include "pkcs11/pkcs11.h"
 
 #include "gck-rpc-layer.h"
+#include "gck-rpc-tls-psk.h"
 
 #include <stdio.h>
 #include <errno.h>
@@ -166,12 +167,12 @@ int main(int argc, char *argv[])
 	CK_C_GetFunctionList func_get_list;
 	CK_FUNCTION_LIST_PTR funcs;
 	void *module;
-	const char *path;
+	const char *path, *tls_psk_keyfile;
 	fd_set read_fds;
 	int sock, ret;
 	CK_RV rv;
 	CK_C_INITIALIZE_ARGS init_args;
-
+	GckRpcTlsPskState *tls;
 
         if (install_syscall_reporter())
                 return 1;
@@ -229,6 +230,27 @@ int main(int argc, char *argv[])
         if (!path)
 	   path = SOCKET_PATH;
 
+	/* Initialize TLS, if appropriate */
+	tls = NULL;
+	if (! strncmp("tls://", path, 6)) {
+		tls_psk_keyfile = getenv("PKCS11_PROXY_TLS_PSK_FILE");
+		if (! tls_psk_keyfile || ! tls_psk_keyfile[0]) {
+			fprintf(stderr, "key file must be specified for tls:// socket.\n");
+			exit(1);
+		}
+
+		tls = calloc(1, sizeof(GckRpcTlsPskState));
+		if (tls == NULL) {
+			fprintf(stderr, "can't allocate memory for TLS-PSK");
+			exit(1);
+		}
+
+		if (! gck_rpc_init_tls_psk(tls, tls_psk_keyfile, NULL, GCK_RPC_TLS_PSK_SERVER)) {
+			fprintf(stderr, "TLS-PSK initialization failed");
+			exit(1);
+		}
+	}
+
         if (strcmp(path,"-") == 0) {
            gck_rpc_layer_inetd(funcs);
         } else {
@@ -254,7 +276,7 @@ int main(int argc, char *argv[])
 		}
 
 		if (FD_ISSET(sock, &read_fds))
-			gck_rpc_layer_accept();
+			gck_rpc_layer_accept(tls);
 	   }
 
 	   gck_rpc_layer_uninitialize();
@@ -266,6 +288,9 @@ int main(int argc, char *argv[])
 			argv[1], (int)rv);
 
 	dlclose(module);
+
+	if (tls)
+		gck_rpc_close_tls(tls);
 
 	return 0;
 }

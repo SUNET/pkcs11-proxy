@@ -25,6 +25,7 @@
 
 #include "gck-rpc-layer.h"
 #include "gck-rpc-private.h"
+#include "gck-rpc-tls-psk.h"
 
 #include "pkcs11/pkcs11.h"
 #include "pkcs11/pkcs11g.h"
@@ -71,14 +72,15 @@ typedef struct _CallState {
 	uint64_t appid;
 	int call;
 	int sock;
-        int (*read)(int, unsigned char *,size_t);
-        int (*write)(int, unsigned char *,size_t);
+        int (*read)(void *cs, unsigned char *,size_t);
+        int (*write)(void *cs, unsigned char *,size_t);
 	struct sockaddr_storage addr;
 	socklen_t addrlen;
 	/* XXX Maybe sessions should be a linked list instead, to remove the hard
 	 * upper limit and reduce typical memory use.
 	 */
 	SessionState sessions[PKCS11PROXY_MAX_SESSION_COUNT];
+	GckRpcTlsPskState *tls;
 } CallState;
 
 typedef struct _DispatchState {
@@ -2137,17 +2139,20 @@ static int dispatch_call(CallState * cs)
 	return 1;
 }
 
-static int read_all(int sock, unsigned char *data, size_t len)
+static int read_all(CallState *cs, void *data, size_t len)
 {
 	int r;
 
-	assert(sock >= 0);
+	assert(cs->sock >= 0);
 	assert(data);
 	assert(len > 0);
 
 	while (len > 0) {
 
-                r = recv(sock, (void *)data, len, 0);
+		if (cs->tls)
+			r = gck_rpc_tls_read_all(cs->tls, data, len);
+		else
+			r = recv(cs->sock, data, len, 0);
 
 		if (r == 0) {
 			/* Connection was closed on client */
@@ -2166,17 +2171,20 @@ static int read_all(int sock, unsigned char *data, size_t len)
 	return 1;
 }
 
-static int write_all(int sock, unsigned char *data, size_t len)
+static int write_all(CallState *cs, void *data, size_t len)
 {
 	int r;
 
-	assert(sock >= 0);
+	assert(cs->sock >= 0);
 	assert(data);
 	assert(len > 0);
 
 	while (len > 0) {
 
-                r = send(sock, (void *)data, len, MSG_NOSIGNAL);
+		if (cs->tls)
+			r = gck_rpc_tls_write_all(cs->tls, (void *) data, len);
+		else
+                        r = send(cs->sock, data, len, MSG_NOSIGNAL);
 
 		if (r == -1) {
 			if (errno == EPIPE) {
@@ -2212,8 +2220,16 @@ static void run_dispatch_loop(CallState *cs)
 		hoststr[0] = portstr[0] = '\0';
 	}
 
+	/* Enable TLS for this socket */
+	if (cs->tls) {
+		if (! gck_rpc_start_tls(cs->tls, cs->sock)) {
+			gck_rpc_warn("Can't enable TLS");
+			return ;
+		}
+	}
+
 	/* The client application */
-	if (!cs->read(cs->sock, (unsigned char *)&cs->appid, sizeof (cs->appid))) {
+	if (! cs->read(cs, (void *)&cs->appid, sizeof (cs->appid))) {
 		gck_rpc_warn("Can't read appid\n");
 		return ;
 	}
@@ -2233,7 +2249,7 @@ static void run_dispatch_loop(CallState *cs)
 		call_reset(cs);
 
 		/* Read the number of bytes ... */
-		if (!cs->read(cs->sock, buf, 4))
+		if (! cs->read(cs, buf, 4))
 			break;
 
 		/* Calculate the number of bytes */
@@ -2252,7 +2268,7 @@ static void run_dispatch_loop(CallState *cs)
 		}
 
 		/* ... and read/parse in the actual message */
-		if (!cs->read(cs->sock, cs->req->buffer.buf, len))
+		if (!cs->read(cs, cs->req->buffer.buf, len))
 			break;
 
 		egg_buffer_add_empty(&cs->req->buffer, len);
@@ -2266,8 +2282,8 @@ static void run_dispatch_loop(CallState *cs)
 
 		/* .. send back response length, and then response data */
 		egg_buffer_encode_uint32(buf, cs->resp->buffer.len);
-		if (!cs->write(cs->sock, buf, 4) ||
-		    !cs->write(cs->sock, cs->resp->buffer.buf, cs->resp->buffer.len))
+		if (!cs->write(cs, buf, 4) ||
+		    !cs->write(cs, cs->resp->buffer.buf, cs->resp->buffer.len))
 			break;
 	}
 
@@ -2299,7 +2315,7 @@ static int pkcs11_socket = -1;
 /* The unix socket path, that we listen on */
 static char pkcs11_socket_path[MAXPATHLEN] = { 0, };
 
-void gck_rpc_layer_accept(void)
+void gck_rpc_layer_accept(GckRpcTlsPskState *tls)
 {
 	struct sockaddr_storage addr;
 	DispatchState *ds, **here;
@@ -2342,6 +2358,7 @@ void gck_rpc_layer_accept(void)
         ds->cs.write = &write_all;
 	ds->cs.addr = addr;
 	ds->cs.addrlen = addrlen;
+	ds->cs.tls = tls;
 
 	error = pthread_create(&ds->thread, NULL,
 			       run_dispatch_thread, &(ds->cs));
@@ -2357,14 +2374,26 @@ void gck_rpc_layer_accept(void)
 	pthread_mutex_unlock(&pkcs11_dispatchers_mutex);
 }
 
+static int _inetd_read(CallState *cs, void *data, size_t len)
+{
+	assert(cs->sock >= 0);
+	return read(cs->sock, data, len);
+}
+
+static int _inetd_write(CallState *cs, void *data, size_t len)
+{
+	assert(cs->sock >= 0);
+	return write(cs->sock, data, len);
+}
+
 void gck_rpc_layer_inetd(CK_FUNCTION_LIST_PTR module)
 {
    CallState cs;
 
    memset(&cs, 0, sizeof(cs));
    cs.sock = STDIN_FILENO;
-   cs.read = &read;
-   cs.write = &write;
+   cs.read = &_inetd_read;
+   cs.write = &_inetd_write;
 
    pkcs11_module = module;
 
@@ -2496,7 +2525,8 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
         }
 #endif
 
-	if (!strncmp("tcp://", prefix, 6)) {
+	if (!strncmp("tcp://", prefix, 6) ||
+	    !strncmp("tls://", prefix, 6)) {
 		/*
 		 * TCP socket
 		 */

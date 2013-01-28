@@ -25,6 +25,7 @@
 
 #include "gck-rpc-layer.h"
 #include "gck-rpc-private.h"
+#include "gck-rpc-tls-psk.h"
 
 #include "pkcs11/pkcs11.h"
 
@@ -67,6 +68,8 @@ static uint64_t pkcs11_app_id = 0;
 
 /* The socket to connect to */
 static char pkcs11_socket_path[MAXPATHLEN] = { 0, };
+/* The TLS-PSK keyfile name */
+static char tls_psk_key_filename[MAXPATHLEN] = { 0, };
 
 /* The error used by us when parsing of rpc message fails */
 #define PARSE_ERROR   CKR_DEVICE_ERROR
@@ -112,6 +115,9 @@ static void parse_argument(char *arg)
 	/* Setup the socket path from the arguments */
 	if (strcmp(arg, "socket") == 0)
 		snprintf(pkcs11_socket_path, sizeof(pkcs11_socket_path), "%s",
+			 value);
+	else if (strcmp(arg, "tls_psk_file") == 0)
+		snprintf(tls_psk_key_filename, sizeof(tls_psk_key_filename), "%s",
 			 value);
 	else
 		warning(("unrecognized argument: %s", arg));
@@ -201,6 +207,7 @@ typedef struct _CallState {
 	GckRpcMessage *req;	/* The current request */
 	GckRpcMessage *resp;	/* The current response */
 	int call_status;
+	GckRpcTlsPskState *tls;
 	struct _CallState *next;	/* For pooling of completed sockets */
 } CallState;
 
@@ -251,7 +258,10 @@ static CK_RV call_write(CallState * cs, unsigned char *data, size_t len)
 			return CKR_DEVICE_ERROR;
 		}
 
-                r = send(fd, (void *)data, len, 0);
+		if (cs->tls)
+			r = gck_rpc_tls_write_all(cs->tls, (void *) data, len);
+		else
+			r = send(fd, (void *) data, len, 0);
 
 		if (r == -1) {
 			if (errno == EPIPE) {
@@ -290,7 +300,10 @@ static CK_RV call_read(CallState * cs, unsigned char *data, size_t len)
 			return CKR_DEVICE_ERROR;
 		}
 
-                r = recv(fd, (void *)data, len, 0);
+		if (cs->tls)
+			r = gck_rpc_tls_read_all(cs->tls, (void *) data, len);
+		else
+			r = recv(fd, (void *) data, len, 0);
 
 		if (r == 0) {
 			warning(("couldn't receive data: daemon closed connection"));
@@ -409,7 +422,8 @@ static CK_RV call_connect(CallState * cs)
 
 	memset(&addr, 0, sizeof(addr));
 
-	if (!strncmp("tcp://", pkcs11_socket_path, 6)) {
+	if (! strncmp("tcp://", pkcs11_socket_path, 6) ||
+	    ! strncmp("tls://", pkcs11_socket_path, 6)) {
 		char *host, *port;
 
 		if (! gck_rpc_parse_host_port(pkcs11_socket_path + 6, &host, &port)) {
@@ -424,6 +438,24 @@ static CK_RV call_connect(CallState * cs)
 		}
 
 		free(host);
+
+		if (! strncmp("tls://", pkcs11_socket_path, 6)) {
+			cs->tls = calloc(1, sizeof(GckRpcTlsPskState));
+			if (cs->tls == NULL) {
+				warning(("can't allocate memory for TLS-PSK"));
+				return CKR_HOST_MEMORY;
+			}
+
+			if (! gck_rpc_init_tls_psk(cs->tls, tls_psk_key_filename, NULL, GCK_RPC_TLS_PSK_CLIENT)) {
+				warning(("TLS-PSK initialization failed"));
+				return CKR_DEVICE_ERROR;
+			}
+
+			if (! gck_rpc_start_tls(cs->tls, sock)) {
+				gck_rpc_warn("failed starting TLS");
+				return CKR_DEVICE_ERROR;
+			}
+		}
 	} else {
 		addr.sun_family = AF_UNIX;
 		strncpy(addr.sun_path, pkcs11_socket_path,
@@ -471,6 +503,9 @@ static void call_destroy(void *value)
 
 		gck_rpc_message_free(cs->req);
 		gck_rpc_message_free(cs->resp);
+
+		if (cs->tls)
+			gck_rpc_close_tls(cs->tls);
 
 		free(cs);
 
@@ -1320,7 +1355,8 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 	if (pkcs11_socket_path[0] == 0) {
 		path = getenv("PKCS11_PROXY_SOCKET");
 		if (path && path[0]) {
-			if (!strncmp("tcp://", path, 6))
+			if ((! strncmp("tcp://", path, 6)) ||
+			    (! strncmp("tls://", path, 6)))
 				snprintf(pkcs11_socket_path,
 					 sizeof(pkcs11_socket_path), "%s",
 					 path);
@@ -1330,6 +1366,23 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 					 "%s.pkcs11", path);
 			pkcs11_socket_path[sizeof(pkcs11_socket_path) - 1] = 0;
 		} else {
+			ret =  CKR_FUNCTION_NOT_SUPPORTED;
+			goto done;
+		}
+	}
+
+	/* If socket path indicates TLS, make sure tls_psk_key_filename is populated. */
+	if (! strncmp("tls://", pkcs11_socket_path, 6)) {
+		if (! tls_psk_key_filename[0]) {
+			path = getenv("PKCS11_PROXY_TLS_PSK_FILE");
+			if (path && path[0]) {
+				snprintf(tls_psk_key_filename, sizeof(tls_psk_key_filename),
+					 "%s", path);
+			}
+		}
+
+		if (! tls_psk_key_filename[0]) {
+			warning(("can't handle tls:// path without a tls-psk file"));
 			ret =  CKR_FUNCTION_NOT_SUPPORTED;
 			goto done;
 		}

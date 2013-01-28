@@ -6,8 +6,8 @@ endif(COMMAND cmake_policy)
 
 project (pkcs11 C)
 
-set(PKCS11_PROXY_SRCS gck-rpc-module.c gck-rpc-message.c gck-rpc-util.c egg-buffer.c)
-set(PKCS11_DAEMON_SRCS egg-buffer.c gck-rpc-daemon-standalone.c gck-rpc-dispatch.c gck-rpc-message.c gck-rpc-util.c syscall-reporter.c syscall-names.h)
+set(PKCS11_PROXY_SRCS gck-rpc-module.c gck-rpc-message.c gck-rpc-util.c egg-buffer.c gck-rpc-tls-psk.c)
+set(PKCS11_DAEMON_SRCS egg-buffer.c gck-rpc-daemon-standalone.c gck-rpc-dispatch.c gck-rpc-message.c gck-rpc-util.c syscall-reporter.c syscall-names.h gck-rpc-tls-psk.c)
 
 add_definitions(-Wall)
 add_library(pkcs11-proxy SHARED ${PKCS11_PROXY_SRCS})
@@ -33,8 +33,8 @@ if (WIN32)
   target_link_libraries (pkcs11-proxy ws2_32)
 endif (WIN32)
 
-target_link_libraries (pkcs11-proxy pthread)
-target_link_libraries (pkcs11-daemon dl pthread)
+target_link_libraries (pkcs11-proxy pthread ssl)
+target_link_libraries (pkcs11-daemon dl pthread ssl)
 
 install_targets (/lib pkcs11-proxy)
 install_targets (/bin pkcs11-daemon)
