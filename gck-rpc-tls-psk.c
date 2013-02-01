@@ -29,6 +29,12 @@
 #include <sys/param.h>
 #include <assert.h>
 
+/* for file I/O */
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 /* TLS pre-shared key */
 static char tls_psk_identity[128] = { 0, };
 static char tls_psk_key_filename[MAXPATHLEN] = { 0, };
@@ -122,8 +128,44 @@ _tls_psk_decode_key(const char *identity, const char *hexkey, unsigned char *psk
 }
 
 /*
+ * Read from a file descriptor until a newline is spotted.
+ *
+ * Using open() and _fgets() instead of fopen() and fgets() avoids having to
+ * seccomp-allow the mmap() syscall.
+ *
+ * Reading one byte at a time is perhaps not optimal from a performance
+ * standpoint, but the kernel will surely have pre-buffered the data anyways.
+ */
+int _fgets(char *buf, unsigned int len, const int fd)
+{
+	int bytes;
+
+	bytes = 0;
+
+	while (len) {
+		if (read(fd, buf, 1) != 1)
+			break;
+		bytes++;
+		if (*buf == '\n') {
+			buf++;
+			len--;
+			break;
+		}
+		buf++;
+		len--;
+	}
+
+	if (! len)
+		/* ran out of space */
+		return -1;
+	*buf = '\0';
+	return bytes;
+}
+
+/*
  * Callbacks invoked by OpenSSL PSK initialization.
  */
+
 
 /* Server side TLS-PSK initialization callback. Given an identity (chosen by the client),
  * locate a pre-shared key and put it in psk.
@@ -136,14 +178,14 @@ _tls_psk_server_cb(SSL *ssl, const char *identity,
 {
 	char line[1024], *hexkey;
 	unsigned int psk_len;
-	FILE *fd;
-	int i;
+	int i, fd;
 
 	debug(("Initializing TLS-PSK with keyfile '%.100s', identity '%.100s'",
 	       tls_psk_key_filename, identity));
 
-	if ((fd = fopen(tls_psk_key_filename, "r")) == NULL) {
-		gck_rpc_warn("can't open TLS-PSK keyfile '%.100s' for reading", tls_psk_key_filename);
+	if ((fd = open(tls_psk_key_filename, O_RDONLY | O_CLOEXEC)) < 0) {
+		gck_rpc_warn("can't open TLS-PSK keyfile '%.100s' for reading : %s",
+			     tls_psk_key_filename, strerror(errno));
 		return 0;
 	}
 
@@ -154,7 +196,7 @@ _tls_psk_server_cb(SSL *ssl, const char *identity,
 	*/
 	psk_len = 0;
 
-	while (fgets(line, sizeof(line) - 1, fd)) {
+	while (_fgets(line, sizeof(line) - 1, fd) > 0) {
 		/* Find first colon and replace it with NULL */
 		hexkey = strchr(line, ':');
 		if (! hexkey)
@@ -178,7 +220,7 @@ _tls_psk_server_cb(SSL *ssl, const char *identity,
 			break;
 		}
 	}
-	fclose(fd);
+	close(fd);
 
 	return psk_len;
 }
@@ -313,11 +355,6 @@ gck_rpc_close_tls(GckRpcTlsPskState *state)
 	if (state->ssl) {
 		SSL_free(state->ssl);
 		state->ssl = NULL;
-	}
-
-	if (state->bio) {
-		BIO_free(state->bio);
-		state->bio = NULL;
 	}
 }
 

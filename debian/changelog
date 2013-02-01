@@ -1,3 +1,12 @@
+pkcs11-proxy (0.4-1ubuntu2) precise; urgency=low
+
+  * Support IPv6 and connect-fallback through getaddrinfo()
+  * Implement TLS-PSK using OpenSSL
+  * Use libseccomp and reduce number of syscalls allowed in dispatchers
+  * Several important bug fixes (now passes SoftHSM test suite)
+
+ -- Fredrik Thulin <fredrik@thulin.net>  Wed, 30 Jan 2013 09:56:34 +0100
+
 pkcs11-proxy (0.4-1ubuntu1) precise; urgency=low
 
   * disable debugging by default 

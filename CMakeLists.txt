@@ -33,8 +33,8 @@ if (WIN32)
   target_link_libraries (pkcs11-proxy ws2_32)
 endif (WIN32)
 
-target_link_libraries (pkcs11-proxy pthread ssl)
-target_link_libraries (pkcs11-daemon dl pthread ssl)
+target_link_libraries (pkcs11-proxy pthread ssl seccomp)
+target_link_libraries (pkcs11-daemon dl pthread ssl seccomp)
 
 install_targets (/lib pkcs11-proxy)
 install_targets (/bin pkcs11-daemon)

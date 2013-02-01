@@ -8,6 +8,8 @@
 
 # define PKCS11PROXY_TLS_PSK_CIPHERS "PSK-AES128-CBC-SHA:PSK-AES256-CBC-SHA";
 
+//# define DEBUG_SECCOMP
+
 #ifdef __MINGW32__
 
 # include <stdint.h>
