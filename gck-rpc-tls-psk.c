@@ -21,6 +21,8 @@
    Author: Fredrik Thulin <fredrik@thulin.net>
 */
 
+#include <string.h>
+
 #include "config.h"
 
 #include "gck-rpc-private.h"
@@ -34,6 +36,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+#include <openssl/ssl.h>
 
 /* TLS pre-shared key */
 static char tls_psk_identity[128] = { 0, };
@@ -265,9 +269,18 @@ gck_rpc_init_tls_psk(GckRpcTlsPskState *state, const char *key_filename,
 
 	assert(caller == GCK_RPC_TLS_PSK_CLIENT || caller == GCK_RPC_TLS_PSK_SERVER);
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 	state->ssl_ctx = SSL_CTX_new(TLSv1_2_method());
+#else
+	state->ssl_ctx = SSL_CTX_new(TLS_method());
+#endif
 
-	if (state->ssl_ctx == NULL) {
+	if (state->ssl_ctx == NULL
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+        || !SSL_CTX_set_min_proto_version(state->ssl_ctx, TLS1_2_VERSION)
+        || !SSL_CTX_set_max_proto_version(state->ssl_ctx, TLS1_2_VERSION)
+#endif
+       ) {
 		gck_rpc_warn("can't initialize SSL_CTX");
 		return 0;
 	}

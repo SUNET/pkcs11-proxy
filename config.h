@@ -11,6 +11,10 @@
 //# define DEBUG_SECCOMP
 //# define SECCOMP
 
+#ifdef __APPLE__
+# define MSG_NOSIGNAL SO_NOSIGPIPE
+#endif
+
 #ifdef __MINGW32__
 
 # include <stdint.h>
@@ -34,7 +38,6 @@ enum  {
 	SHUT_RDWR /* No more receptions or transmissions.  */
 };
 
-#ifdef  __MINGW32__
 static inline int inet_aton(const char * cp, struct in_addr *pin)
 {
         int rc = inet_addr(cp);
@@ -44,7 +47,6 @@ static inline int inet_aton(const char * cp, struct in_addr *pin)
         pin->s_addr = rc;
         return 1;
 }
-#endif
 
 #endif
 

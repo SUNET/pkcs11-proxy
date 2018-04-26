@@ -9,12 +9,19 @@
  * The code may be used by anyone for any purpose, and can serve as a
  * starting point for developing applications using mode 2 seccomp.
  */
+#include <signal.h>
+#include <string.h>
+
+#ifdef DEBUG_SECCOMP
 #include "syscall-reporter.h"
+#endif
+
 #include "syscall-names.h"
 
 const char * const msg_needed = "Looks like you also need syscall: ";
 
 /* Since "sprintf" is technically not signal-safe, reimplement %d here. */
+#ifdef SECCOMP
 static void write_uint(char *buf, unsigned int val)
 {
 	int width = 0;
@@ -33,7 +40,6 @@ static void write_uint(char *buf, unsigned int val)
 
 static void reporter(int nr, siginfo_t *info, void *void_context)
 {
-#ifdef SECCOMP
 	char buf[128];
 	ucontext_t *ctx = (ucontext_t *)(void_context);
 	unsigned int syscall;
@@ -53,8 +59,8 @@ static void reporter(int nr, siginfo_t *info, void *void_context)
 	strcat(buf, "\n");
 	write(STDERR_FILENO, buf, strlen(buf));
 	_exit(1);
-#endif
 }
+#endif
 
 int install_syscall_reporter(void)
 {

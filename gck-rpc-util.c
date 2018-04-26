@@ -96,6 +96,7 @@ int gck_rpc_mechanism_has_sane_parameters(CK_MECHANISM_TYPE type)
 	switch (type) {
 	case CKM_RSA_PKCS_OAEP:
 	case CKM_RSA_PKCS_PSS:
+    case CKM_AES_CBC_PAD:
 		return 1;
 	default:
 		return 0;
