@@ -376,7 +376,7 @@ gck_rpc_tls_write_all(GckRpcTlsPskState *state, void *data, unsigned int len)
 			ERR_error_string_n(error, buf, sizeof(buf));
 			warning(("SSL_write error: %s", buf));
 		}
-		return 0;
+		return -1;
 	}
 
 	return bytes;
